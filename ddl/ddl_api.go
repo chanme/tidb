@@ -2150,6 +2150,22 @@ func resolveAlterTableSpec(ctx sessionctx.Context, specs []*ast.AlterTableSpec) 
 	return validSpecs, nil
 }
 
+func isSpecsInTypes(specs []*ast.AlterTableSpec, validTypeList []ast.AlterTableType) bool {
+	for _, spec := range specs {
+		sameType := false
+		for _, validType := range validTypeList {
+			if spec.Tp == validType {
+				sameType = true
+				break
+			}
+		}
+		if !sameType {
+			return false
+		}
+	}
+	return true
+}
+
 func isSameTypeMultiSpecs(specs []*ast.AlterTableSpec) bool {
 	specType := specs[0].Tp
 	for _, spec := range specs {
@@ -2172,14 +2188,20 @@ func (d *ddl) AlterTable(ctx sessionctx.Context, ident ast.Ident, specs []*ast.A
 	}
 
 	if len(validSpecs) > 1 {
+		if isSpecsInTypes(validSpecs, []ast.AlterTableType{ast.AlterTableDropIndex, ast.AlterTableDropPrimaryKey}) {
+			err = d.DropIndexes(ctx, ident, validSpecs)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			return nil
+		}
+
 		if isSameTypeMultiSpecs(validSpecs) {
 			switch validSpecs[0].Tp {
 			case ast.AlterTableAddColumns:
 				err = d.AddColumns(ctx, ident, validSpecs)
 			case ast.AlterTableDropColumn:
 				err = d.DropColumns(ctx, ident, validSpecs)
-			case ast.AlterTableDropIndex:
-				err = d.DropIndexes(ctx, ident, validSpecs)
 			default:
 				return errRunMultiSchemaChanges
 			}

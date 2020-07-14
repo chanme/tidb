@@ -1305,6 +1305,87 @@ func (s *testDBSuite2) TestDropIndex(c *C) {
 	testDropIndex(c, s.store, s.lease, createSQL, dropIdxSQL, idxName)
 }
 
+func (s *testDBSuite3) TestDropMultiIndex(c *C) {
+	idxNames := []string{"primary", "c2_index", "c3_index"}
+	createSQL := "create table test_drop_multi_index (c1 int, c2 int, c3 int, primary key(c1), key c2_index(c2), key c3_index (c3))"
+	dropIdxSQL := "alter table test_drop_multi_index drop index primary, drop index c2_index, drop index c3_index"
+	testDropMultiIndex(c, s.store, s.lease, createSQL, dropIdxSQL, idxNames)
+}
+
+func testDropMultiIndex(c *C, store kv.Storage, lease time.Duration, createSQL string, dropIdxSQL string, idxNames []string) {
+	tk := testkit.NewTestKit(c, store)
+	tk.MustExec("use test_db")
+	tk.MustExec("drop table if exists test_drop_multi_index")
+	tk.MustExec(createSQL)
+	done := make(chan error, 1)
+	tk.MustExec("delete from test_drop_multi_index")
+	num := 100
+	//  add some rows
+	for i := 0; i < num; i++ {
+		tk.MustExec("insert into test_drop_multi_index values (?, ?, ?)", i, i, i)
+	}
+	ctx := tk.Se.(sessionctx.Context)
+	t := testGetTableByName(c, ctx, "test_db", "test_drop_multi_index")
+	prevName2Index := make(map[string]table.Index)
+
+	for _, tidx := range t.Indices() {
+		prevName2Index[tidx.Meta().Name.L] = tidx
+	}
+	for _, idxName := range idxNames {
+		_, ok := prevName2Index[idxName]
+		c.Assert(ok, IsTrue)
+	}
+
+	testddlutil.SessionExecInGoroutine(c, store, dropIdxSQL, done)
+
+	ticker := time.NewTicker(lease / 2)
+	defer ticker.Stop()
+LOOP:
+	for {
+		select {
+		case err := <-done:
+			if err == nil {
+				break LOOP
+			}
+			c.Assert(err, IsNil, Commentf("err:%v", errors.ErrorStack(err)))
+		case <-ticker.C:
+			step := 5
+			// delete some rows, and add some data
+			for i := num; i < num+step; i++ {
+				n := rand.Intn(num)
+				tk.MustExec("update test_drop_multi_index set c2 = 1 where c1 = ?", n)
+				tk.MustExec("insert into test_drop_multi_index values (?, ?, ?)", i, i, i)
+			}
+			num += step
+		}
+	}
+
+	for _, idxName := range idxNames {
+		arows := tk.MustQuery("explain select c1 from test_drop_multi_index where c1 >= 0")
+		c.Assert(strings.Contains(fmt.Sprintf("%v", arows), idxName), IsFalse)
+		brows := tk.MustQuery("explain select c1 from test_drop_multi_index where c2 >= 0")
+		c.Assert(strings.Contains(fmt.Sprintf("%v", brows), idxName), IsFalse)
+		crows := tk.MustQuery("explain select c1 from test_drop_multi_index where c3 >= 0")
+		c.Assert(strings.Contains(fmt.Sprintf("%v", crows), idxName), IsFalse)
+	}
+
+	t = testGetTableByName(c, ctx, "test_db", "test_drop_multi_index")
+	postName2Index := make(map[string]table.Index)
+	for _, tidx := range t.Indices() {
+		postName2Index[tidx.Meta().Name.L] = tidx
+	}
+	for _, idxName := range idxNames {
+		_, ok := postName2Index[idxName]
+		c.Assert(ok, IsFalse)
+	}
+
+	for _, tidx := range prevName2Index {
+		idx := tables.NewIndex(t.Meta().ID, t.Meta(), tidx.Meta())
+		checkDelRangeDone(c, ctx, idx)
+	}
+	tk.MustExec("drop table test_drop_multi_index")
+}
+
 func testDropIndex(c *C, store kv.Storage, lease time.Duration, createSQL, dropIdxSQL, idxName string) {
 	tk := testkit.NewTestKit(c, store)
 	tk.MustExec("use test_db")
