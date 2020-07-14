@@ -192,6 +192,40 @@ func rollingbackDropColumns(t *meta.Meta, job *model.Job) (ver int64, err error)
 	return ver, nil
 }
 
+func rollingbackDropIndexes(t *meta.Meta, job *model.Job) (ver int64, err error) {
+	tblInfo, indexInfos, err := checkDropIndexes(t, job)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+
+	originalState := indexInfos[0].State
+	switch indexInfos[0].State {
+	case model.StateWriteOnly, model.StateDeleteOnly, model.StateDeleteReorganization, model.StateNone:
+		// We can not rollback now, so just continue to drop index.
+		// Normally won't fetch here, because there is check when cancel ddl jobs. see function: isJobRollbackable.
+		job.State = model.JobStateRunning
+		return ver, nil
+	case model.StatePublic:
+		job.State = model.JobStateRollbackDone
+		setIndexesState(indexInfos, model.StatePublic)
+	default:
+		return ver, ErrInvalidDDLState.GenWithStackByArgs("index", indexInfos[0].State)
+	}
+	// TODO understand the meaning of Args
+	indexNames := make([]model.CIStr, 0, len(indexInfos))
+	for _, indexInfo := range indexInfos {
+		indexNames = append(indexNames, indexInfo.Name)
+	}
+	job.SchemaState = indexInfos[0].State
+	job.Args = []interface{}{indexNames}
+	ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfos[0].State)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	job.FinishTableJob(model.JobStateRollbackDone, model.StatePublic, ver, tblInfo)
+	return ver, errCancelledDDLJob
+}
+
 func rollingbackDropIndex(t *meta.Meta, job *model.Job) (ver int64, err error) {
 	tblInfo, indexInfo, err := checkDropIndex(t, job)
 	if err != nil {
@@ -335,6 +369,8 @@ func convertJob2RollbackJob(w *worker, d *ddlCtx, t *meta.Meta, job *model.Job) 
 		ver, err = rollingbackDropColumns(t, job)
 	case model.ActionDropIndex, model.ActionDropPrimaryKey:
 		ver, err = rollingbackDropIndex(t, job)
+	case model.ActionDropIndexes:
+		ver, err = rollingbackDropIndexes(t, job)
 	case model.ActionDropTable, model.ActionDropView, model.ActionDropSequence:
 		err = rollingbackDropTableOrView(t, job)
 	case model.ActionDropTablePartition:

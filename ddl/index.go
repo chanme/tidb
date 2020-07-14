@@ -15,6 +15,7 @@ package ddl
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"strconv"
 	"sync/atomic"
@@ -583,6 +584,143 @@ func (w *worker) onCreateIndex(d *ddlCtx, t *meta.Meta, job *model.Job, isPK boo
 	return ver, errors.Trace(err)
 }
 
+func onDropIndexes(t *meta.Meta, job *model.Job) (ver int64, _ error) {
+	tblInfo, indexInfos, err := checkDropIndexes(t, job)
+	if err != nil {
+		return ver, errors.Trace(err)
+	}
+	logutil.BgLogger().Info("tblInfo" + tblInfo.Name.L)
+	for _, indexInfo := range indexInfos {
+		logutil.BgLogger().Info("indexInfo" + indexInfo.Name.L)
+	}
+
+	dependentHiddenCols := make([]*model.ColumnInfo, 0)
+	for _, indexInfo := range indexInfos {
+		for _, indexColumn := range indexInfo.Columns {
+			if tblInfo.Columns[indexColumn.Offset].Hidden {
+				dependentHiddenCols = append(dependentHiddenCols, tblInfo.Columns[indexColumn.Offset])
+			}
+		}
+	}
+
+	originalState := indexInfos[0].State
+	switch indexInfos[0].State {
+	case model.StatePublic:
+		// public -> write only
+		job.SchemaState = model.StateWriteOnly
+		setIndexesState(indexInfos, model.StateWriteOnly)
+		if len(dependentHiddenCols) > 0 {
+			logutil.BgLogger().Info("dependentHiddenCols > 0 should check inside")
+			for i := 0; i < len(dependentHiddenCols); i++ {
+				dependentHiddenColOffset := dependentHiddenCols[i].Offset
+				tblInfo.Columns[dependentHiddenColOffset].State = model.StateWriteOnly
+				// Set this column's offset to the last and reset all following columns' offsets.
+				adjustColumnInfoInDropColumn(tblInfo, dependentHiddenColOffset)
+			}
+		}
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfos[0].State)
+	case model.StateWriteOnly:
+		// write only -> delete only
+		job.SchemaState = model.StateDeleteOnly
+		setIndexesState(indexInfos, model.StateDeleteOnly)
+		for _, indexInfo := range indexInfos {
+			updateHiddenColumns(tblInfo, indexInfo, model.StateDeleteOnly)
+		}
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfos[0].State)
+	case model.StateDeleteOnly:
+		// delete only -> reorganization
+		job.SchemaState = model.StateDeleteReorganization
+		setIndexesState(indexInfos, model.StateDeleteReorganization)
+		for _, indexInfo := range indexInfos {
+			updateHiddenColumns(tblInfo, indexInfo, model.StateDeleteReorganization)
+		}
+		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfos[0].State)
+	case model.StateDeleteReorganization:
+		// reorganization -> absent
+		indexNamesMap := make(map[string]bool)
+		for _, indexInfo := range indexInfos {
+			indexNamesMap[indexInfo.Name.L] = true
+		}
+		newIndices := make([]*model.IndexInfo, 0, len(tblInfo.Indices))
+		for _, idx := range tblInfo.Indices {
+			if indexNamesMap[idx.Name.L] {
+				continue
+			}
+			newIndices = append(newIndices, idx)
+		}
+		tblInfo.Indices = newIndices
+		// Set column index flag.
+		for _, indexInfo := range indexInfos {
+			dropIndexColumnFlag(tblInfo, indexInfo)
+		}
+		tblInfo.Columns = tblInfo.Columns[:len(tblInfo.Columns)-len(dependentHiddenCols)]
+
+		ver, err = updateVersionAndTableInfoWithCheck(t, job, tblInfo, originalState != model.StateNone)
+		if err != nil {
+			return ver, errors.Trace(err)
+		}
+
+		indexIDs := make([]int64, 0, len(indexInfos))
+		for _, indexInfo := range indexInfos {
+			indexIDs = append(indexIDs, indexInfo.ID)
+		}
+		// add multi index is not available, job will not be rolling back
+		job.FinishTableJob(model.JobStateDone, model.StateNone, ver, tblInfo)
+		job.Args = append(job.Args, indexIDs, getPartitionIDs(tblInfo))
+
+	default:
+		err = ErrInvalidDDLState.GenWithStackByArgs("index", indexInfos[0].State)
+	}
+	return ver, errors.Trace(err)
+}
+
+func setIndexesState(indexInfos []*model.IndexInfo, state model.SchemaState) {
+	for i := range indexInfos {
+		indexInfos[i].State = state
+	}
+}
+
+func checkDropIndexes(t *meta.Meta, job *model.Job) (*model.TableInfo, []*model.IndexInfo, error) {
+	schemaID := job.SchemaID
+	tblInfo, err := getTableInfoAndCancelFaultJob(t, job, schemaID)
+	if err != nil {
+		return nil, nil, errors.Trace(err)
+	}
+
+	var indexNames []model.CIStr
+	var ifExists []bool
+	if err = job.DecodeArgs(&indexNames, &ifExists); err != nil {
+		job.State = model.JobStateCancelled
+		return nil, nil, errors.Trace(err)
+	}
+	indexInfos := make([]*model.IndexInfo, 0, len(indexNames))
+	for _, indexName := range indexNames {
+		indexInfo := tblInfo.FindIndexByName(indexName.L)
+		if indexInfo == nil {
+			job.State = model.JobStateCancelled
+			return nil, nil, ErrCantDropFieldOrKey.GenWithStack("index %s doesn't exist", indexName)
+		}
+		err = checkDropIndexOnAutoIncrementColumn(tblInfo, indexInfo)
+		if err != nil {
+			job.State = model.JobStateCancelled
+			return nil, nil, autoid.ErrWrongAutoKey
+		}
+		indexInfos = append(indexInfos, indexInfo)
+	}
+	return tblInfo, indexInfos, nil
+}
+
+func printColumnInfo(columnInfos []*model.ColumnInfo, tt string) {
+	for _, columnInfo := range columnInfos {
+		hidden := 0
+		if columnInfo.Hidden {
+			hidden = 1
+		}
+		colmsg := fmt.Sprintf("COLINFO type %s name %s offset %d hidden %b state %d", tt, columnInfo.Name.L, columnInfo.Offset, hidden, columnInfo.State)
+		logutil.BgLogger().Info(colmsg)
+	}
+}
+
 func onDropIndex(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 	tblInfo, indexInfo, err := checkDropIndex(t, job)
 	if err != nil {
@@ -603,11 +741,13 @@ func onDropIndex(t *meta.Meta, job *model.Job) (ver int64, _ error) {
 		job.SchemaState = model.StateWriteOnly
 		indexInfo.State = model.StateWriteOnly
 		if len(dependentHiddenCols) > 0 {
+			printColumnInfo(dependentHiddenCols, "START")
 			firstHiddenOffset := dependentHiddenCols[0].Offset
 			for i := 0; i < len(dependentHiddenCols); i++ {
 				tblInfo.Columns[firstHiddenOffset].State = model.StateWriteOnly
 				// Set this column's offset to the last and reset all following columns' offsets.
 				adjustColumnInfoInDropColumn(tblInfo, firstHiddenOffset)
+				printColumnInfo(dependentHiddenCols, "LOOP"+string(i))
 			}
 		}
 		ver, err = updateVersionAndTableInfo(t, job, tblInfo, originalState != indexInfo.State)

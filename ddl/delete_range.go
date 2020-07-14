@@ -342,6 +342,35 @@ func insertJobIntoDeleteRangeTable(ctx sessionctx.Context, job *model.Job) error
 			endKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID+1)
 			return doInsert(s, job.ID, indexID, startKey, endKey, now)
 		}
+	case model.ActionDropIndexes:
+		tableID := job.TableID
+		var indexNames interface{}
+		var ifExists interface{}
+		var indexIDs []int64
+		var partitionIDs []int64
+		logutil.BgLogger().Info("delete range in ActionDropIndexes")
+		if err := job.DecodeArgs(&indexNames, &ifExists, &indexIDs, &partitionIDs); err != nil {
+			return errors.Trace(err)
+		}
+		if len(partitionIDs) > 0 {
+			for _, pid := range partitionIDs {
+				for _, indexID := range indexIDs {
+					startKey := tablecodec.EncodeTableIndexPrefix(pid, indexID)
+					endKey := tablecodec.EncodeTableIndexPrefix(pid, indexID+1)
+					if err := doInsert(s, job.ID, indexID, startKey, endKey, now); err != nil {
+						return errors.Trace(err)
+					}
+				}
+			}
+		} else {
+			for _, indexID := range indexIDs {
+				startKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID)
+				endKey := tablecodec.EncodeTableIndexPrefix(tableID, indexID+1)
+				if err := doInsert(s, job.ID, indexID, startKey, endKey, now); err != nil {
+					return errors.Trace(err)
+				}
+			}
+		}
 	}
 	return nil
 }

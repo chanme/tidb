@@ -2178,6 +2178,8 @@ func (d *ddl) AlterTable(ctx sessionctx.Context, ident ast.Ident, specs []*ast.A
 				err = d.AddColumns(ctx, ident, validSpecs)
 			case ast.AlterTableDropColumn:
 				err = d.DropColumns(ctx, ident, validSpecs)
+			case ast.AlterTableDropIndex:
+				err = d.DropIndexes(ctx, ident, validSpecs)
 			default:
 				return errRunMultiSchemaChanges
 			}
@@ -4582,6 +4584,108 @@ func (d *ddl) DropForeignKey(ctx sessionctx.Context, ti ast.Ident, fkName model.
 	}
 
 	err = d.doDDLJob(ctx, job)
+	err = d.callHookOnChanged(err)
+	return errors.Trace(err)
+}
+
+func (d *ddl) debugDropIndex(info *model.TableInfo) {
+	for _, column := range info.Columns {
+		hidden := 0
+		if column.Hidden {
+			hidden = 1
+		}
+		colmsg := fmt.Sprintf("COLINFO name %s offset %d hidden %b state %d", column.Name.L, column.Offset, hidden, column.State)
+		logutil.BgLogger().Warn(colmsg)
+	}
+	for _, index := range info.Indices {
+		colnames := make([]string, 0, len(index.Columns))
+		for _, col := range index.Columns {
+			colnames = append(colnames, col.Name.L)
+		}
+		indexColumns := strings.Join(colnames, "|")
+		indexmsg := fmt.Sprintf("INDEXINFO name %s column %s state %d", index.Name.L, indexColumns, index.State)
+		logutil.BgLogger().Warn(indexmsg)
+	}
+}
+
+func (d *ddl) DropIndexes(ctx sessionctx.Context, ti ast.Ident, specs []*ast.AlterTableSpec) error {
+	is := d.infoHandle.Get()
+	schema, ok := is.SchemaByName(ti.Schema)
+	logutil.BgLogger().Warn("[ddl] dropping multi indexes")
+	if !ok {
+		return errors.Trace(infoschema.ErrDatabaseNotExists)
+	}
+	t, err := is.TableByName(ti.Schema, ti.Name)
+	if err != nil {
+		return errors.Trace(infoschema.ErrTableNotExists.GenWithStackByArgs(ti.Schema, ti.Name))
+	}
+	d.debugDropIndex(t.Meta())
+	ifExists := make([]bool, 0, len(specs))
+	indexNames := make([]model.CIStr, 0, len(specs))
+	dupIndexNames := make(map[string]bool)
+	for _, spec := range specs {
+		indexName := model.NewCIStr(spec.Name)
+		indexInfo := t.Meta().FindIndexByName(indexName.L)
+		var isPK bool
+		if indexName.L == strings.ToLower(mysql.PrimaryKeyName) &&
+			// Before we fixed #14243, there might be a general index named `primary` but not a primary key.
+			(indexInfo == nil || indexInfo.Primary) {
+			isPK = true
+		}
+		if isPK {
+			if !config.GetGlobalConfig().AlterPrimaryKey {
+				return ErrUnsupportedModifyPrimaryKey.GenWithStack("Unsupported drop primary key when alter-primary-key is false")
+
+			}
+			// If the table's PKIsHandle is true, we can't find the index from the table. So we check the value of PKIsHandle.
+			if indexInfo == nil && !t.Meta().PKIsHandle {
+				return ErrCantDropFieldOrKey.GenWithStack("Can't DROP 'PRIMARY'; check that column/key exists")
+			}
+			if t.Meta().PKIsHandle {
+				return ErrUnsupportedModifyPrimaryKey.GenWithStack("Unsupported drop primary key when the table's pkIsHandle is true")
+			}
+		}
+		if indexInfo == nil {
+			err = ErrCantDropFieldOrKey.GenWithStack("index %s doesn't exist", indexName)
+			if spec.IfExists {
+				ctx.GetSessionVars().StmtCtx.AppendNote(err)
+				return nil
+			}
+			return err
+		}
+		// Check for drop index on auto_increment column.
+		err = checkDropIndexOnAutoIncrementColumn(t.Meta(), indexInfo)
+		if err != nil {
+			return errors.Trace(err)
+		}
+
+		if dupIndexNames[indexInfo.Name.L] && !spec.IfExists {
+			return ErrCantDropFieldOrKey.GenWithStackByArgs(indexInfo.Name.L)
+		}
+		if dupIndexNames[indexInfo.Name.L] && spec.IfExists {
+			ctx.GetSessionVars().StmtCtx.AppendWarning(ErrCantDropFieldOrKey.GenWithStackByArgs(indexInfo.Name.L))
+		}
+
+		if !dupIndexNames[indexInfo.Name.L] {
+			ifExists = append(ifExists, spec.IfExists)
+			indexNames = append(indexNames, indexName)
+		}
+
+		dupIndexNames[indexInfo.Name.L] = true
+	}
+	jobTp := model.ActionDropIndexes
+
+	job := &model.Job{
+		SchemaID:   schema.ID,
+		TableID:    t.Meta().ID,
+		SchemaName: schema.Name.L,
+		Type:       jobTp,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{indexNames, ifExists},
+	}
+
+	err = d.doDDLJob(ctx, job)
+
 	err = d.callHookOnChanged(err)
 	return errors.Trace(err)
 }
